@@ -1,0 +1,11 @@
+[package]
+name = "option"
+version = "0.1.0"
+authors = ["Alister Lee <alister@dev.shortepic.com>"]
+
+[dependencies]
+rusqlite = "0.10.1"
+clap = "2.21.1"
+error-chain = "0.10.0"
+log = "0.3.7"
+env_logger = "0.4.2"
