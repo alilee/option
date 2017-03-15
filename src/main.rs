@@ -2,6 +2,7 @@
 
 extern crate rusqlite;
 extern crate clap;
+extern crate rand;
 
 #[macro_use]
 extern crate log;
@@ -19,6 +20,7 @@ use rusqlite::Connection;
 use clap::{Arg, App, SubCommand};
 use errors::*;
 use std::path::Path;
+use rand::distributions::{Weighted, WeightedChoice, IndependentSample};
 
 fn main() {
 
@@ -50,8 +52,8 @@ fn main() {
 
 fn initialise_db(conn: &Connection) -> Result<()> {
     conn.execute_batch("begin; create table schema_versions(version integer, installed_at date \
-                        default (datetime('now'))); insert into schema_versions(version) values \
-                        (0); commit;")
+                        default (date('now','localtime'))); insert into schema_versions(version) \
+                        values (0); commit;")
         .chain_err(|| "creating schema_versions")?;
     Ok(())
 }
@@ -72,16 +74,163 @@ fn migrate(conn: &Connection) -> Result<u32> {
     if current_version < 1 {
         conn.execute_batch("
            begin;
-           create table events(id integer, name text, delta integer, log text);
+           create table events(name text, \
+               delta integer, \
+               log text, \
+               created_at timestamp default (datetime('now','localtime')));
            insert into schema_versions(version) values (1);
            commit;
-        ");
+        ")
+            .chain_err(|| "migrating schema version 1")?;
     }
 
-    Ok(1)
+    if current_version < 2 {
+        conn.execute_batch("
+           begin;
+           create table settings(name text, value integer);
+           insert into settings(name, value) VALUES ('default_weight', 5);
+           insert into schema_versions(version) values (2);
+           commit;
+        ")
+            .chain_err(|| "migrating schema version 2")?;
+    }
+
+    Ok(2)
 }
 
-fn add(name: )
+fn setting(conn: &Connection, name: &str, default: u32) -> u32 {
+    let x: u32 = conn.query_row("SELECT value FROM events WHERE name=?",
+                   &[&name],
+                   |row| row.get(0))
+        .unwrap_or(default);
+    x
+}
+
+fn add(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("insert into events(name, delta)
+                  select ?, value from settings where name = 'default_weight';",
+                 &[&name])
+        .chain_err(|| "inserting name")?;
+    trace!("inserted {}", name);
+    Ok(())
+}
+
+fn kill(conn: &Connection, name: &str) -> Result<()> {
+    let x: i32 = conn.query_row("SELECT sum(ifnull(delta,0)) FROM events WHERE name=?",
+                   &[&name],
+                   |row| row.get(0))
+        .unwrap();
+    trace!("{:?}", x);
+
+    conn.execute("INSERT INTO events(name, delta) VALUES (?,?)",
+                 &[&name, &(0 - x)])
+        .chain_err(|| "inserting negative total delta into name")?;
+    trace!("killed {}", name);
+    Ok(())
+}
+
+fn default(conn: &Connection, weight: &u32) -> Result<()> {
+    conn.execute("update settings set value = ?
+                  where name = 'default_weight'",
+                 &[weight])
+        .chain_err(|| "updating weight setting")?;
+    trace!("updated default weight to {}", weight);
+    Ok(())
+}
+
+fn reset(conn: &Connection, weight: &u32) -> Result<()> {
+    conn.execute("INSERT INTO events(name, delta, log)
+                  SELECT name, ?-sum(ifnull(delta,0)), 'Reset'
+                  FROM events
+                  GROUP BY name
+                  HAVING sum(ifnull(delta,0)) > 0",
+                 &[weight])
+        .chain_err(|| "resetting all weights")?;
+    trace!("resetting all non-zero weights to {}", weight);
+    Ok(())
+}
+
+fn list(conn: &Connection) -> Result<()> {
+
+    trace!("listing");
+
+    let mut stmt = conn.prepare("
+        SELECT name, sum(ifnull(delta,0))
+        FROM events
+        GROUP \
+                  BY name
+        HAVING sum(ifnull(delta,0)) > 0
+        ORDER BY name
+    ")
+        .unwrap();
+
+    let choice_iter = stmt.query_map(&[], |row| {
+            let name: String = row.get(0);
+            let val: u32 = row.get(1);
+            (name, val)
+        })
+        .unwrap();
+
+    for choice in choice_iter {
+        let c = choice.unwrap();
+        println!("{}: {}", c.0, c.1);
+    }
+    Ok(())
+}
+
+fn choose(conn: &Connection) -> Result<()> {
+
+    trace!("choosing");
+
+    let mut stmt = conn.prepare("
+        SELECT name, sum(ifnull(delta,0))
+        FROM events
+        GROUP \
+                  BY name
+        HAVING sum(ifnull(delta,0)) > 0
+        ORDER BY name
+    ")
+        .unwrap();
+
+    let mut choices: Vec<Weighted<String>> = stmt.query_map(&[], |row| {
+            Weighted::<String> {
+                weight: row.get(1),
+                item: row.get(0),
+            }
+        })
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+
+    let wc = WeightedChoice::new(&mut choices);
+    let mut rng = rand::thread_rng();
+    println!("selected: {}", wc.ind_sample(&mut rng));
+
+    Ok(())
+}
+
+fn log(conn: &Connection, name: &str, message: Option<&str>, delta: i32) -> Result<()> {
+    conn.execute("insert into events(name, log, delta)
+                  values (?, ?, ?)",
+                 &[&name, &message.unwrap_or(""), &delta])
+        .chain_err(|| "adding a log")?;
+    trace!("inserted an event for {}", name);
+    Ok(())
+}
+
+fn set(conn: &Connection, name: &str, message: Option<&str>, weight: u32) -> Result<()> {
+    conn.execute("INSERT INTO events(name, delta, log)
+                  SELECT name, ?-sum(ifnull(delta,0)), ?
+                  FROM events
+                  WHERE name = ?
+                  GROUP BY name
+                  HAVING sum(ifnull(delta,0)) > 0",
+                 &[&weight, &message.unwrap_or(""), &name])
+        .chain_err(|| "resetting all weights")?;
+    trace!("resetting weight for {}", name);
+    Ok(())
+}
+
 
 fn run() -> Result<()> {
     let app = App::new("Option")
@@ -157,20 +306,67 @@ fn run() -> Result<()> {
 
     let version: u32 = migrate(&conn).chain_err(|| "here")?;
     info!("version: {}", version);
+    trace!("{:?}", cmdline.subcommand());
 
     match cmdline.subcommand() {
-        ("add", Some(sub_m)) => add(sub_m.value_of("name").unwrap()).chain_err(|| "adding option")?,
-        ("kill", Some(sub_m)) => {}
-        ("default", Some(sub_m)) => {}
-        ("reset", Some(sub_m)) => {}
-        ("list", Some(sub_m)) => {}
-        ("choose", Some(sub_m)) => {}
-        ("log", Some(sub_m)) => {}
-        ("like", Some(sub_m)) => {}
-        ("hate", Some(sub_m)) => {}
-        ("set", Some(sub_m)) => {}
-        _ => app.print_help().chain_err(|| "printing usage")?,
+        ("add", Some(sub_m)) => {
+            add(&conn, sub_m.value_of("NAME").unwrap()).chain_err(|| "adding option")?;
+            Ok(())
+        }
+        ("kill", Some(sub_m)) => {
+            kill(&conn, sub_m.value_of("NAME").unwrap()).chain_err(|| "killing option")?;
+            Ok(())
+        }
+        ("default", Some(sub_m)) => {
+            let weight = u32::from_str_radix(sub_m.value_of("WEIGHT").unwrap(),10).chain_err(|| "converting default weight")?;
+            default(&conn, &weight).chain_err(|| "setting default weight")?;
+            Ok(())
+        }
+        ("reset", Some(sub_m)) => {
+            let weight = match sub_m.value_of("weight") {
+                None => setting(&conn, "default_weight", 5),
+                Some(w) => u32::from_str_radix(w, 10).chain_err(|| "converting reset value")?,
+            };
+            reset(&conn, &weight).chain_err(|| "resetting to weight")?;
+            Ok(())
+        }
+        ("list", Some(_)) => {
+            list(&conn).chain_err(|| "listing")?;
+            Ok(())
+        }
+        ("choose", Some(_)) => {
+            choose(&conn).chain_err(|| "choosing")?;
+            Ok(())
+        }
+        ("log", Some(sub_m)) => {
+            log(&conn,
+                sub_m.value_of("NAME").unwrap(),
+                sub_m.value_of("MESSAGE"),
+                0).chain_err(|| "log entry")?;
+            Ok(())
+        }
+        ("like", Some(sub_m)) => {
+            log(&conn,
+                sub_m.value_of("NAME").unwrap(),
+                sub_m.value_of("message"),
+                1).chain_err(|| "log entry")?;
+            Ok(())
+        }
+        ("hate", Some(sub_m)) => {
+            log(&conn,
+                sub_m.value_of("NAME").unwrap(),
+                sub_m.value_of("message"),
+                -1).chain_err(|| "log entry")?;
+            Ok(())
+        }
+        ("set", Some(sub_m)) => {
+            let weight = u32::from_str_radix(sub_m.value_of("WEIGHT").unwrap(),10).chain_err(|| "converting target weight")?;
+            set(&conn,
+                sub_m.value_of("NAME").unwrap(),
+                sub_m.value_of("message"),
+                weight).chain_err(|| "log entry")?;
+            Ok(())
+        }
+        _ => bail!("incorrect options"),
     }
-
-    Ok(())
 }
